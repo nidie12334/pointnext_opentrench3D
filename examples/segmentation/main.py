@@ -5,6 +5,9 @@ If more than 1 GPU is provided, will launch multi processing distributed trainin
 if you only wana use 1 GPU, set `CUDA_VISIBLE_DEVICES` accordingly
 """
 import __init__
+from openpoints.dataset.build import DATASETS as BUILD_DATASETS
+from openpoints.dataset.OpenTrench3D.OpenTrench3D import OpenTrench3D
+BUILD_DATASETS.module_dict['OpenTrench3D'] = OpenTrench3D
 import argparse, yaml, os, logging, numpy as np, csv, wandb, glob
 from tqdm import tqdm
 import torch, torch.nn as nn
@@ -150,12 +153,13 @@ def main(gpu, cfg):
     scheduler = build_scheduler_from_cfg(cfg, optimizer)
 
     # build dataset
-    val_loader = build_dataloader_from_cfg(cfg.get('val_batch_size', cfg.batch_size),
-                                           cfg.dataset,
-                                           cfg.dataloader,
-                                           datatransforms_cfg=cfg.datatransforms,
-                                           split='val',
-                                           distributed=cfg.distributed
+    val_loader = build_dataloader_from_cfg(    
+                                            batch_size        = cfg.get('val_batch_size', cfg.batch_size),
+                                            dataset_cfg       = cfg.dataset,
+                                            dataloader_cfg    = cfg.dataloader.val,
+                                            datatransforms_cfg= cfg.datatransforms,
+                                            split             = 'val',
+                                            distributed       = False,
                                            )
     logging.info(f"length of validation dataset: {len(val_loader.dataset)}")
     num_classes = val_loader.dataset.num_classes if hasattr(val_loader.dataset, 'num_classes') else None
@@ -213,12 +217,13 @@ def main(gpu, cfg):
         for p in model_module.encoder.blocks.parameters():
             p.requires_grad = False
 
-    train_loader = build_dataloader_from_cfg(cfg.batch_size,
-                                             cfg.dataset,
-                                             cfg.dataloader,
-                                             datatransforms_cfg=cfg.datatransforms,
-                                             split='train',
-                                             distributed=cfg.distributed,
+    train_loader = build_dataloader_from_cfg(        
+                                                batch_size        = cfg.get('train_batch_size', cfg.batch_size),
+                                                dataset_cfg       = cfg.dataset,
+                                                dataloader_cfg    = cfg.dataloader.train,
+                                                datatransforms_cfg= cfg.datatransforms,
+                                                split             = 'train',
+                                                distributed       = False,    # 或者 True（如果使用多卡）
                                              )
     logging.info(f"length of training dataset: {len(train_loader.dataset)}")
 
@@ -316,11 +321,12 @@ def main(gpu, cfg):
             writer.add_scalar('test_oa', test_oa, epoch)
         write_to_csv(test_oa, test_macc, test_miou, test_ious, best_epoch, cfg, write_header=True)
         logging.info(f'save results in {cfg.csv_path}')
+        
         if cfg.use_voting:
             load_checkpoint(model, pretrained_path=os.path.join(cfg.ckpt_dir, f'{cfg.run_name}_ckpt_best.pth'))
             set_random_seed(cfg.seed)
             val_miou, val_macc, val_oa, val_ious, val_accs = validate_fn(model, val_loader, cfg, num_votes=20,
-                                                                         data_transform=data_transform, epoch=epoch)
+                                                                         epoch=epoch)
             if writer is not None:
                 writer.add_scalar('val_miou20', val_miou, cfg.epochs + 50)
 

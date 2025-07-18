@@ -1,0 +1,115 @@
+# —— 全局超参 ——  
+lr: 0.001
+batch_size: 8
+num_classes: 5            # ← 顶层补上，避免 NoneType 错误
+
+# —— 数据集配置 ——  
+dataset:
+  common:
+    NAME: OpenTrench3D              # 日志标识
+    type: OpenTrench3D              # Registry 查找的 key
+    root: /home/tech/pointnext/datasets/OpenTrench3D   # 数据根目录
+    area: water                     # ← 修改为大写以匹配目录名 ← 修改
+  type: OpenTrench3D
+  root: /home/tech/pointnext/datasets/OpenTrench3D
+  split: train                     # 用于训练
+  num_classes: 5                   # 与顶层 num_classes 保持一致
+  ignore_label: 4
+  area: water                      # ← 同上修改
+
+# —— 模型配置 ——  
+model:
+  NAME: BaseSeg
+  num_classes: 5
+  ignore_label: 4
+  pretrained_path: null
+
+  encoder_args:
+    NAME: PointNextEncoder
+    blocks: [1, 1, 1, 1, 1]
+    strides: [1, 4, 4, 4, 4]
+    sa_layers: 2
+    sa_use_res: true
+    width: 32
+    in_channels: 3
+    expansion: 4
+    radius: 0.1
+    nsample: 32
+    aggr_args:
+      feature_type: 'dp_fj'
+      reduction: 'max'
+    group_args:
+      NAME: 'ballquery'
+      normalize_dp: true
+    conv_args:
+      order: 'conv-norm-act'
+    act_args:
+      act: 'relu'
+    norm_args:
+      norm: 'bn'
+
+  decoder_args:
+    NAME: PointNextDecoder
+  cls_args:
+    NAME: SegHead
+    num_classes: 5
+    in_channels: null
+    norm_args:
+      norm: 'bn'
+
+# —— DataLoader 参数 ——  
+dataloader:
+  train:
+    batch_size: 2
+    num_workers: 1
+    shuffle: true
+    pin_memory: false
+    drop_last: true
+    #collate_fn: 'concat_collate_fn'   # ← 新增：支持变长点云批处理
+    collate_fn: 'pad_collate_fn'  # ← 完整路径
+  val:
+    batch_size: 2
+    num_workers: 1
+    shuffle: false
+    pin_memory: false
+    drop_last: false
+    #collate_fn: 'concat_collate_fn'   # ← 新增：验证也使用同样的拼接函数
+    collate_fn: 'pad_collate_fn'   # ← 完整路径
+
+# —— 训练流程 ——  
+training:
+  mode: train
+  epochs: 100
+  output_dir: outputs/water_pretrain
+
+# —— 优化器 & 调度 ——  
+optimizer:
+  NAME: AdamW
+  weight_decay: 1e-4
+sched: cosine
+scheduler:
+  T_max: 100
+  eta_min: 1e-5
+
+# —— 数据增强 ——  
+datatransforms:
+  train:
+    - ChromaticAutoContrast
+    - PointsToTensor
+    - PointCloudScaling
+    - PointCloudXYZAlign
+    - PointCloudJitter
+    - ChromaticDropGPU
+    - ChromaticNormalize
+  val:
+    - PointsToTensor
+    - PointCloudXYZAlign
+    - ChromaticNormalize
+  vote:
+    - ChromaticDropGPU
+  kwargs:
+    color_drop: 0.2
+    gravity_dim: 2
+    scale: [0.9, 1.1]
+    jitter_sigma: 0.005
+    jitter_clip: 0.02

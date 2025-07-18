@@ -7,7 +7,10 @@
 #source ~/.bashrc
 
 
-# The following 4 lines are only for slurm machines. uncomment if needed.  
+# The following 4 lines are only for slurm machines. uncomment if needed.
+export CUDA_HOME=/usr/local/cuda-12.9
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH  
 export TORCH_CUDA_ARCH_LIST="6.1;6.2;7.0;7.5;8.0"   # a100: 8.0; v100: 7.0; 2080ti: 7.5; titan xp: 6.1
 module purge
 module load cuda/11.1.1
@@ -25,8 +28,8 @@ conda create -n openpoints -y python=3.7 numpy=1.20 numba
 conda activate openpoints
 
 # please always double check installation for pytorch and torch-scatter from the official documentation
-conda install -y pytorch=1.10.1 torchvision cudatoolkit=11.3 -c pytorch -c nvidia
-pip install torch-scatter -f https://data.pyg.org/whl/torch-1.10.1+cu113.html
+conda install -y pytorch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 pytorch-cuda=12.1 -c pytorch -c nvidia
+pip install torch-scatter -f https://data.pyg.org/whl/torch-2.3.0+cu121.html
 
 pip install -r requirements.txt
 
