@@ -150,3 +150,8 @@ semantic_kitti/shapenet/
 # 忽略 datasets 文件夹及其所有内容
 datasets/
 datasets/**
+# 忽略 CUDA deb 安装包和大文件
+*.deb
+
+# 忽略 BFG 工具文件（可选，如果不想上传）
+bfg.jar
