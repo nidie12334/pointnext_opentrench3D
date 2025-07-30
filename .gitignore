@@ -157,3 +157,5 @@ datasets/**
 bfg.jar
 
 *.deb.1
+
+*.log

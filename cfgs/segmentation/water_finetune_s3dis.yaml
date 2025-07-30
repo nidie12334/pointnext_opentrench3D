@@ -1,0 +1,123 @@
+# —— 全局超参 ——  
+lr: 0.001           # 解释：初始学习率，控制每次梯度更新的步长  
+batch_size: 2       # 解释：全局批大小，若脚本优先读取这一值，则覆盖 dataloader 中的设置  
+num_classes: 5      # 解释：分割任务的类别总数，模型输出通道数  
+
+# —— 数据集配置 ——  
+dataset:
+  common:
+    NAME: OpenTrench3D            # 解释：日志和命令行中显示的数据集名称  
+    type: OpenTrench3D            # 解释：Registry 查找对应的数据集类的 key  
+    root: /home/tech/pointnext/datasets/OpenTrench3D   # 解释：数据集根目录路径  
+    area: water                   # 解释：指定使用子集“water” 
+    voxel_size: 0.05           # —— 新增体素化 
+  type: OpenTrench3D              # 解释：同上，顶层的数据集类型  
+  root: /home/tech/pointnext/datasets/OpenTrench3D     # 解释：同上，顶层的数据根目录  
+  split: train                    # 解释：当前使用的是训练集  
+  num_classes: 5                  # 解释：类别数量，与全局 num_classes 保持一致  
+  ignore_label: 4                 # 解释：标签值为 4 的点将被忽略，不参与损失计算  
+  area: water                     # 解释：同上，顶层的子集标识  
+
+# —— 模型配置 ——  
+model:
+  NAME: BaseSeg                   # 解释：Registry 中注册的分割模型名称  
+  num_classes: 5                  # 解释：输出分割头的通道数  
+  ignore_label: 4                 # 解释：同数据集配置，忽略特定标签  
+  pretrained_path: /home/tech/pointnext/s3dis-train-pointnext-s-ngpus1-seed1742-20220525-162639-Gz4ViiL95b6KP9MMH2ytG3_ckpt_best.pth           # 解释：加载预训练权重 
+  pretrained_module: encoder 
+
+  encoder_args:
+    NAME: PointNextEncoder        # 解释：编码器模块名  
+    blocks: [1, 1, 1, 1, 1]       # 解释：每个分辨率下残差块的数量  
+    strides: [1, 4, 4, 4, 4]      # 解释：各阶段下采样步长  
+    sa_layers: 2                  # 解释：自注意力（Self-Attention）层数  
+    sa_use_res: true              # 解释：是否在 SA 层使用残差连接  
+    width: 32                     # 解释：基础通道数，原来 32 缩小到 16  
+    in_channels: 3                # 解释：输入特征通道数，通常是 x,y,z  
+    expansion: 4                  # 解释：通道扩展倍数  
+    radius: 0.1                   # 解释：球邻域查询半径  
+    nsample: 32                   # 解释：球邻域内采样点数  
+    aggr_args:                    # 解释：特征聚合相关参数  
+      feature_type: 'dp_fj'       # 解释：聚合方式，距离 + 特征拼接  
+      reduction: 'max'            # 解释：聚合操作，取最大值  
+    group_args:                   # 解释：分组查询相关参数  
+      NAME: 'ballquery'           # 解释：使用球查询的方法  
+      normalize_dp: true          # 解释：是否归一化距离权重  
+    conv_args:                    # 解释：卷积顺序设置  
+      order: 'conv-norm-act'      # 解释：先卷积再归一化再激活  
+    act_args:                     # 解释：激活函数设置  
+      act: 'relu'                 # 解释：使用 ReLU 激活  
+    norm_args:                    # 解释：归一化层设置  
+      norm: 'bn'                  # 解释：使用 BatchNorm  
+
+  decoder_args:
+    NAME: PointNextDecoder        # 解释：Registry 中解码器模块名  
+  cls_args:
+    NAME: SegHead                 # 解释：分割头模块名  
+    num_classes: 5                # 解释：输出通道数，等于类别数  
+    in_channels: null             # 解释：自动从 decoder 中推断输入通道  
+    norm_args:
+      norm: 'bn'                  # 解释：头部使用 BatchNorm  
+
+# —— DataLoader 参数 ——  
+dataloader:
+  train:
+    batch_size: 2                # 解释：训练时每批样本数量  
+    num_workers: 1               # 解释：加载数据的子进程数  
+    shuffle: true                # 解释：是否在每 epoch 打乱数据  
+    pin_memory: false            # 解释：是否将数据放到固定内存，加速 GPU 读取  
+    drop_last: true              # 解释：若最后一个 batch 不足 batch_size，则丢弃  
+    collate_fn: pad_collate_fn   # 解释：自定义拼接函数，pad 到相同点数  
+  val:
+    batch_size: 2                # 解释：验证时每批样本数量  
+    num_workers: 1  
+    shuffle: false  
+    pin_memory: false  
+    drop_last: false  
+    collate_fn: pad_collate_fn  
+
+# —— 训练流程 ——  
+training:
+  mode: train                   # 解释：运行模式，train 或 eval  
+  epochs: 50                   # 解释：训练总轮数  
+  output_dir: outputs/water_pretrain  # 解释：训练输出（模型、日志）保存路径  
+  use_amp: true                 # 解释：是否开启自动混合精度  
+  accum_iter: 4                 # 解释：梯度累积步数，每累积 4 个 batch 再 optimizer.step()  
+
+# —— 优化器 & 调度 ——  
+optimizer:
+  NAME: AdamW                   # 解释：使用 AdamW 优化器  
+  weight_decay: 0.0001            # 解释：权重衰减系数  
+  filter_bias_and_bn: False
+sched: cosine                   # 解释：顶层调度类型，用于调度工厂函数分支判断  
+
+scheduler:
+  NAME: CosineAnnealingLR        # 解释：调度器名称，对应 PyTorch 余弦退火实现  
+  T_max: 100                     # 解释：退火周期，多少个 epoch 或 step  
+  eta_min: 1e-5                  # 解释：最小学习率  
+
+# —— 数据增强 & 采样 ——  
+datatransforms:
+  train:
+      
+    - ChromaticAutoContrast     # 解释：自动对比度调整  
+    - PointsToTensor            # 解释：转换为 PyTorch Tensor  
+    - PointCloudScaling         # 解释：随机缩放点云  
+    - PointCloudXYZAlign        # 解释：坐标轴对齐  
+    - PointCloudJitter          # 解释：随机抖动  
+    - ChromaticDropGPU          # 解释：随机丢弃颜色通道  
+    - ChromaticNormalize        # 解释：颜色归一化  
+  val:
+      
+    - PointsToTensor  
+    - PointCloudXYZAlign  
+    - ChromaticNormalize  
+  vote:
+    - ChromaticDropGPU          # 解释：投票阶段的数据增强  
+  kwargs:
+    num_points: 8964            # 解释：采样后的点数  
+    color_drop: 0.2             # 解释：颜色丢弃概率  
+    gravity_dim: 2              # 解释：重力轴方向索引（0,1,2）  
+    scale: [0.9, 1.1]           # 解释：缩放范围下限与上限  
+    jitter_sigma: 0.005         # 解释：抖动高斯分布标准差  
+    jitter_clip: 0.02           # 解释：抖动裁剪阈值  

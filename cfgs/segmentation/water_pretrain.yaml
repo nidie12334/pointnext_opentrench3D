@@ -1,7 +1,8 @@
+
 # —— 全局超参 ——  
 lr: 0.001           # 解释：初始学习率，控制每次梯度更新的步长  
 batch_size: 2       # 解释：全局批大小，若脚本优先读取这一值，则覆盖 dataloader 中的设置  
-num_classes: 5      # 解释：分割任务的类别总数，模型输出通道数  
+num_classes: 2      # 解释：分割任务的类别总数，模型输出通道数  
 
 # —— 数据集配置 ——  
 dataset:
@@ -9,18 +10,20 @@ dataset:
     NAME: OpenTrench3D            # 解释：日志和命令行中显示的数据集名称  
     type: OpenTrench3D            # 解释：Registry 查找对应的数据集类的 key  
     root: /home/tech/pointnext/datasets/OpenTrench3D   # 解释：数据集根目录路径  
-    area: water                   # 解释：指定使用子集“water”  
+    area: water                   # 解释：指定使用子集“water” 
+    voxel_size: 0.05           # —— 新增体素化 
+    trench_class_id: 2     # ← 原来 Trench 类的 class id（请根据你数据确认）
   type: OpenTrench3D              # 解释：同上，顶层的数据集类型  
   root: /home/tech/pointnext/datasets/OpenTrench3D     # 解释：同上，顶层的数据根目录  
   split: train                    # 解释：当前使用的是训练集  
-  num_classes: 5                  # 解释：类别数量，与全局 num_classes 保持一致  
+  num_classes: 2                  # 解释：类别数量，与全局 num_classes 保持一致  
   ignore_label: 4                 # 解释：标签值为 4 的点将被忽略，不参与损失计算  
   area: water                     # 解释：同上，顶层的子集标识  
 
 # —— 模型配置 ——  
 model:
   NAME: BaseSeg                   # 解释：Registry 中注册的分割模型名称  
-  num_classes: 5                  # 解释：输出分割头的通道数  
+  num_classes: 2                  # 解释：输出分割头的通道数  
   ignore_label: 4                 # 解释：同数据集配置，忽略特定标签  
   pretrained_path: null           # 解释：不加载任何预训练权重  
 
@@ -52,10 +55,16 @@ model:
     NAME: PointNextDecoder        # 解释：Registry 中解码器模块名  
   cls_args:
     NAME: SegHead                 # 解释：分割头模块名  
-    num_classes: 5                # 解释：输出通道数，等于类别数  
+    num_classes: 2                # 解释：输出通道数，等于类别数  
     in_channels: null             # 解释：自动从 decoder 中推断输入通道  
     norm_args:
       norm: 'bn'                  # 解释：头部使用 BatchNorm  
+
+# —— 损失配置（二分类权重）―――
+cls_weighed_loss: true
+criterion_args:
+  NAME: CrossEntropy
+  weight: [18.50, 1.06]
 
 # —— DataLoader 参数 ——  
 dataloader:
@@ -81,6 +90,7 @@ training:
   output_dir: outputs/water_pretrain  # 解释：训练输出（模型、日志）保存路径  
   use_amp: true                 # 解释：是否开启自动混合精度  
   accum_iter: 4                 # 解释：梯度累积步数，每累积 4 个 batch 再 optimizer.step()  
+  sched_on_epoch: true
 
 # —— 优化器 & 调度 ——  
 optimizer:
@@ -118,4 +128,4 @@ datatransforms:
     gravity_dim: 2              # 解释：重力轴方向索引（0,1,2）  
     scale: [0.9, 1.1]           # 解释：缩放范围下限与上限  
     jitter_sigma: 0.005         # 解释：抖动高斯分布标准差  
-    jitter_clip: 0.02           # 解释：抖动裁剪阈值  
+    jitter_clip: 0.02           # 解释：抖动裁剪阈值
