@@ -159,3 +159,8 @@ bfg.jar
 *.deb.1
 
 *.log
+
+*.rar
+
+OpenTrench3D/
+OpenTrench3D/**

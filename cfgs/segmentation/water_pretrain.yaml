@@ -3,6 +3,9 @@
 lr: 0.001           # 解释：初始学习率，控制每次梯度更新的步长  
 batch_size: 2       # 解释：全局批大小，若脚本优先读取这一值，则覆盖 dataloader 中的设置  
 num_classes: 2      # 解释：分割任务的类别总数，模型输出通道数  
+use_imbalanced_sampler: False
+feature_keys: "x"
+          
 
 # —— 数据集配置 ——  
 dataset:
@@ -12,10 +15,12 @@ dataset:
     root: /home/tech/pointnext/datasets/OpenTrench3D   # 解释：数据集根目录路径  
     area: water                   # 解释：指定使用子集“water” 
     voxel_size: 0.05           # —— 新增体素化 
+    
+    
     trench_class_id: 2     # ← 原来 Trench 类的 class id（请根据你数据确认）
   type: OpenTrench3D              # 解释：同上，顶层的数据集类型  
   root: /home/tech/pointnext/datasets/OpenTrench3D     # 解释：同上，顶层的数据根目录  
-  split: train                    # 解释：当前使用的是训练集  
+  split: train_pre                    # 解释：当前使用的是训练集  
   num_classes: 2                  # 解释：类别数量，与全局 num_classes 保持一致  
   ignore_label: 4                 # 解释：标签值为 4 的点将被忽略，不参与损失计算  
   area: water                     # 解释：同上，顶层的子集标识  
@@ -34,7 +39,7 @@ model:
     sa_layers: 2                  # 解释：自注意力（Self-Attention）层数  
     sa_use_res: true              # 解释：是否在 SA 层使用残差连接  
     width: 32                     # 解释：基础通道数，原来 32 缩小到 16  
-    in_channels: 3                # 解释：输入特征通道数，通常是 x,y,z  
+    in_channels: 4               # 解释：输入特征通道数，通常是 x,y,z  
     expansion: 4                  # 解释：通道扩展倍数  
     radius: 0.1                   # 解释：球邻域查询半径  
     nsample: 32                   # 解释：球邻域内采样点数  
@@ -61,10 +66,21 @@ model:
       norm: 'bn'                  # 解释：头部使用 BatchNorm  
 
 # —— 损失配置（二分类权重）―――
-cls_weighed_loss: true
+cls_weighed_loss: false
 criterion_args:
   NAME: CrossEntropy
   weight: [18.50, 1.06]
+
+# —— 新增：类平衡 Focal Loss 超参数 ——  
+use_focal_loss: true        # 启用 Focal Loss
+use_cb_focal_loss: true     # 在 Focal Loss 中使用有效样本数权重
+cb_beta: 0.9999             # 控制权重的平滑程度，接近论文推荐设置
+focal_gamma: 2.0      # （可选，若你想指定 gamma）
+
+# —— 新增：Tversky Loss 参数 ——  
+use_tversky_loss: true      # 启用 Tversky Loss 优先替代其他损失
+tversky_alpha: 0.3          # Tversky Loss 中 FalsePositive 权重
+tversky_beta: 0.7           # Tversky Loss 中 FalseNegative 权重
 
 # —— DataLoader 参数 ——  
 dataloader:
@@ -108,8 +124,8 @@ scheduler:
 datatransforms:
   train:
       
-    - ChromaticAutoContrast     # 解释：自动对比度调整  
-    - PointsToTensor            # 解释：转换为 PyTorch Tensor  
+     
+    - PointCloudToTensor 
     - PointCloudScaling         # 解释：随机缩放点云  
     - PointCloudXYZAlign        # 解释：坐标轴对齐  
     - PointCloudJitter          # 解释：随机抖动  
@@ -117,13 +133,13 @@ datatransforms:
     - ChromaticNormalize        # 解释：颜色归一化  
   val:
       
-    - PointsToTensor  
+    - PointCloudToTensor
     - PointCloudXYZAlign  
     - ChromaticNormalize  
   vote:
     - ChromaticDropGPU          # 解释：投票阶段的数据增强  
   kwargs:
-    num_points: 8192            # 解释：采样后的点数  
+    num_points: 8964            # 解释：采样后的点数  
     color_drop: 0.2             # 解释：颜色丢弃概率  
     gravity_dim: 2              # 解释：重力轴方向索引（0,1,2）  
     scale: [0.9, 1.1]           # 解释：缩放范围下限与上限  

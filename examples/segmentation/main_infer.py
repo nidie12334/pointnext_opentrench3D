@@ -31,7 +31,56 @@ import torch.nn.functional as F
 from torch.utils.data import Sampler
 from torch.utils.data import DataLoader
 from openpoints.dataset.build import build_dataset_from_cfg
+import os, numpy as np, torch
+import json
 warnings.simplefilter(action='ignore', category=FutureWarning)
+
+class FastImbalancedSampler(Sampler):
+    """
+    轻量版不均衡采样：  
+    只打开 <root>/<area>/<split> 下的 PLY 文件，跳过 header 后只扫描 class 列，
+    忽略 ignore_label，trench_id 之外的都当成“负类”计数，生成权重。
+    """
+    def __init__(self, root, area, split, ignore_label, trench_id, cache_path=None):
+        # 1) 找到要采样的文件列表
+        ply_dir = os.path.join(root, area, split)
+        paths = sorted(glob.glob(os.path.join(ply_dir, '*.ply')))
+
+        # 2) 如果有缓存，就直接加载 JSON
+        if cache_path and os.path.exists(cache_path):
+            self.weights = torch.DoubleTensor(json.load(open(cache_path)))
+            return
+
+        # 3) 否则逐文件扫描 class 列
+        weights = []
+        for ply_path in paths:
+            cnt_neg = 0
+            with open(ply_path, 'r') as f:
+                # 跳过 header
+                for line in f:
+                    if line.strip() == 'end_header':
+                        break
+                # 统计负类：cls != trench_id 且 != ignore_label
+                for l in f:
+                    cls = int(l.strip().split()[-1])
+                    if cls == ignore_label:
+                        continue
+                    if cls != trench_id:
+                        cnt_neg += 1
+            weights.append(float(cnt_neg) if cnt_neg > 0 else 0.0)
+
+        # 4) 缓存权重，下次直接加载
+        if cache_path:
+            json.dump(weights, open(cache_path, 'w'))
+
+        self.weights = torch.DoubleTensor(weights)
+
+    def __iter__(self):
+        # 以 weights 为概率，返回 len(weights) 次有放回抽样结果
+        return iter(torch.multinomial(self.weights, len(self.weights), replacement=True).tolist())
+
+    def __len__(self):
+        return len(self.weights)
 
 class ImbalancedDatasetSampler(Sampler):
     """
@@ -98,7 +147,114 @@ def focal_loss(inputs, targets, alpha, gamma=2.0, ignore_index=None):
     loss  = -at * ((1 - pt) ** gamma) * logpt
     return loss.mean()
 
+def compute_effective_class_weights(dataset, num_classes, beta=0.9999):
+     """
+     Compute class-balanced weights for each class based on the effective number of samples
+     defined in Cui et al., CVPR 2019. For a class with n samples, the effective number
+     is (1 - beta**n) / (1 - beta), and the weight is proportional to (1 - beta)/(1 - beta**n).
+     The weights are normalised so that their sum equals num_classes.
 
+     Args:
+         dataset: training dataset, each item should provide labels in item['y'] or item['label']
+         num_classes: total number of classes
+         beta: hyperparameter beta in [0,1). Larger beta (e.g. 0.9999) gives smoother weighting.
+
+     Returns:
+         torch.Tensor of shape (num_classes,) containing normalised class weights.
+     """
+     import numpy as _np
+     counts = _np.zeros(num_classes, dtype=_np.float64)
+     for idx in range(len(dataset)):
+         item = dataset[idx]
+         if 'y' in item:
+             labels = item['y']
+         elif 'label' in item:
+             labels = item['label']
+         else:
+             continue
+         if hasattr(labels, 'cpu'):
+             labels_np = labels.squeeze(-1).cpu().numpy()
+         else:
+             labels_np = _np.array(labels).squeeze()
+         for cls in range(num_classes):
+             counts[cls] += (labels_np == cls).sum()
+     counts[counts == 0] = 1.0
+     weights = (1.0 - beta) / (1.0 - _np.power(beta, counts))
+     weights_sum = weights.sum()
+     if weights_sum > 0:
+         weights = weights / weights_sum * num_classes
+     weights_tensor = torch.tensor(weights, dtype=torch.float32)
+     return weights_tensor
+
+def compute_effective_class_weights_by_voxel(dataset, num_classes, beta=0.9999, voxel_size=None):
+    """
+    统计所有子云中，每个类别出现过的不同体素数，计算 CB 权重。
+    """
+    import numpy as _np
+    from openpoints.dataset.data_util import voxelize
+
+    # 累加每类出现的体素单元数量
+    voxel_counts = _np.zeros(num_classes, dtype=int)
+    for idx in range(len(dataset)):
+        item = dataset[idx]
+        coords = item['pos'].cpu().numpy()           # (N,3)
+        labels = item['y'].squeeze(-1).cpu().numpy()  # (N,)
+        # voxelize 返回: (sorted_idx, voxel_idx, count)
+        _, voxel_idx, _ = voxelize(coords, voxel_size, mode=1)
+        for cls in range(num_classes):
+            if (labels == cls).any():
+                voxel_counts[cls] += _np.unique(voxel_idx[labels == cls]).size
+    # === 改用“平均每文件”级别的 n_i 来缩小量级 ===
+    # 计算平均体素数：总体素数 / 文件数
+    counts_mean = voxel_counts.astype(_np.float64) / len(dataset)
+    # 防止太小或为0
+    counts_mean[counts_mean < 1.0] = 1.0
+    logging.info(f"[DEBUG] per-file average voxel_counts: {counts_mean.tolist()}")
+    # 计算 CB 权重并归一化
+    raw_w = (1.0 - beta) / (1.0 - _np.power(beta, counts_mean))
+    weights = raw_w / raw_w.sum() * num_classes
+    weights_tensor = torch.tensor(weights, dtype=torch.float32).cuda()
+    logging.info(f"[DEBUG] computed CB alpha by voxel(avg): {weights_tensor.cpu().tolist()}")
+    return weights_tensor
+
+class TverskyLoss(nn.Module):
+    """
+    Tversky Loss for point cloud segmentation.
+    """
+    def __init__(self, alpha=0.3, beta=0.7, eps=1e-6, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.eps = eps
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        """
+        inputs: (B, C, N)  网络输出的 logits
+        targets: (B, N)    对应的点级标签
+        """
+        # 计算概率
+        probs = F.softmax(inputs, dim=1)
+        # one-hot 编码
+        with torch.no_grad():
+            one_hot = torch.zeros_like(probs)
+            one_hot.scatter_(1, targets.unsqueeze(1), 1)
+        # 计算 TP, FP, FN
+        dims = (0, 2)  # 对 batch 和点维度求和
+        TP = torch.sum(probs * one_hot, dims)
+        FP = torch.sum(probs * (1 - one_hot), dims)
+        FN = torch.sum((1 - probs) * one_hot, dims)
+        # 计算 Tversky 指数
+        tversky = (TP + self.eps) / (TP + self.alpha * FP + self.beta * FN + self.eps)
+        # 损失 = 1 - 指数
+        loss = 1.0 - tversky
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+        
 # ★—— Monkey-patch 全局 write_obj ——★
 def _patched_write_obj(points, colors, fname):
     os.makedirs(os.path.dirname(fname), exist_ok=True)
@@ -189,7 +345,13 @@ def load_data(data_path, cfg):
         ply   = PlyData.read(data_path)
         v     = ply['vertex']
         coord = np.stack([v['x'],v['y'],v['z']],axis=-1).astype(np.float32)
-        feat  = np.stack([v['red'],v['green'],v['blue']],axis=-1).astype(np.float32) / 255.0
+        # 同时读取 法向量 (nx,ny,nz) 和 曲率 (curvature)
+        
+        normals = np.stack([v['nx'], v['ny'], v['nz']], axis=-1).astype(np.float32)
+        curv    = np.expand_dims(np.array(v['curvature'], dtype=np.float32), 1)  # (N,1)
+        feat    = np.concatenate([normals, curv], axis=1)                        # (N,4)
+        print(">>> ENTERED OPENTRENCH3D BRANCH", flush=True)
+        print(f">>> RAW feat.shape = {feat.shape}", flush=True)
         labels = np.array(v['class'], dtype=np.int64)
 
         # ② 过滤掉 ignore_label
@@ -254,7 +416,10 @@ def main(gpu, cfg):
     set_random_seed(cfg.seed + cfg.rank, deterministic=cfg.deterministic)
     torch.backends.cudnn.enabled = True
     logging.info(cfg)
-
+    logging.info(f"[DEBUG CFG] use_focal_loss={cfg.get('use_focal_loss')}, "
+                 f"use_cb_focal_loss={cfg.get('use_cb_focal_loss')}, "
+                 f"cb_beta={cfg.get('cb_beta')}, "
+                 f"focal_gamma={cfg.get('focal_gamma')}")
     if cfg.model.get('in_channels', None) is None:
         cfg.model.in_channels = cfg.model.encoder_args.in_channels
     model = build_model_from_cfg(cfg.model).to(cfg.rank)
@@ -280,7 +445,7 @@ def main(gpu, cfg):
                                             dataset_cfg       = cfg.dataset,
                                             dataloader_cfg    = cfg.dataloader.val,
                                             datatransforms_cfg= cfg.datatransforms,
-                                            split             = 'val',
+                                            split             = 'val_pre',
                                             distributed       = False,
                                            )
     logging.info(f"length of validation dataset: {len(val_loader.dataset)}")
@@ -358,13 +523,22 @@ def main(gpu, cfg):
         dataset_cfg       = cfg.dataset,
         dataloader_cfg    = cfg.dataloader.train,
         datatransforms_cfg= cfg.datatransforms,
-        split             = 'train',
+        split             = 'train_pre',
         distributed       = cfg.distributed,
     )
     train_dataset = _tmp_loader.dataset
+    logging.info(f"[DEBUG] train_dataset type: {type(train_dataset)}, length: {len(train_dataset)}")
+    logging.info(f"[DEBUG CFG dataset] {cfg.dataset}")
 
     if cfg.get('use_imbalanced_sampler', False):
-        sampler = ImbalancedDatasetSampler(train_dataset)
+        sampler = FastImbalancedSampler(
+            root=cfg.dataset.common.root,
+            area=cfg.dataset.common.area,
+            split='train_pre',                              # or cfg.dataset.split
+            ignore_label=cfg.dataset.ignore_label,    # e.g. 4
+            trench_id=cfg.dataset.common.trench_class_id,    # e.g. 2
+            cache_path=os.path.join(cfg.run_dir, 'imbalance_weights.json')
+        )
         train_loader = DataLoader(
             train_dataset,
             batch_size=cfg.batch_size,               # sampler 已经决定了“每次一个样本”
@@ -380,7 +554,7 @@ def main(gpu, cfg):
             dataset_cfg       = cfg.dataset,
             dataloader_cfg    = cfg.dataloader.train,
             datatransforms_cfg= cfg.datatransforms,
-            split             = 'train',
+            split             = cfg.dataset.split,
             distributed       = cfg.distributed,
         )
 
@@ -389,6 +563,13 @@ def main(gpu, cfg):
     if hasattr(train_loader.dataset, 'num_classes'):
         train_loader.dataset.num_classes = cfg.num_classes
         batch = next(iter(train_loader))
+        # —— DEBUG: 检查批次中的特征键及通道数 ——  
+        logging.info(f">>> DEBUG keys in batch: {batch.keys()}")  
+        if 'feat' in batch:
+            logging.info(f">>> DEBUG feat shape: {batch['feat'].shape}")  
+        if 'x' in batch:
+            logging.info(f">>> DEBUG x shape: {batch['x'].shape}")  
+        # 以下为原有标签分布打印  
         labels = batch['y'].squeeze(-1).view(-1).cpu()
         unique, counts = torch.unique(labels, return_counts=True)
         print(f"[DEBUG batch] unique labels: {unique.tolist()}, counts: {counts.tolist()}")
@@ -406,6 +587,7 @@ def main(gpu, cfg):
             w = w.cpu().tolist()
         logging.info(f"[DEBUG] CE class weights: {w}")
     if cfg.get('use_focal_loss', False):
+        logging.info("[DEBUG] >>> entering use_focal_loss block")
         alpha = torch.tensor(cfg.criterion_args.weight if cfg.get('cls_weighed_loss') else [1]*cfg.num_classes)
         logging.info(f"[DEBUG] focal alpha: {alpha.tolist()}, gamma: {cfg.get('focal_gamma', None)}")
 
@@ -417,41 +599,48 @@ def main(gpu, cfg):
         if i >= 2: break
 
     # —— STEP2: 构建加权交叉熵或 Focal Loss —— 
-# 先按原逻辑构建加权/非加权的 CrossEntropy
-    if cfg.get('cls_weighed_loss', False):
-        # 直接从 YAML 里拿 [w0, w1] 并转成 Tensor
-        cfg.criterion_args.weight = torch.tensor(
-            cfg.criterion_args.weight,
-            dtype=torch.float32
-        ).cuda()
-    else:
-        cfg.criterion_args.weight = None
-    criterion = build_criterion_from_cfg(cfg.criterion_args).cuda()
-
-    # —— DEBUG: 打印交叉熵的 class 权重（已经是 Tensor 了）——
-    if isinstance(cfg.criterion_args.weight, torch.Tensor):
-        w = cfg.criterion_args.weight.cpu().tolist()
-    else:
-        w = cfg.criterion_args.weight
-    logging.info(f"[DEBUG] CE class weights: {w}")
-
-    # 如果在命令行或 YAML 打开了 focal loss，就覆盖上面那个 criterion
-    if cfg.get('use_focal_loss', False):
-        # 准备 alpha
-        if cfg.get('cls_weighed_loss', False) and cfg.criterion_args.weight is not None:
-            alpha = torch.tensor(cfg.criterion_args.weight, dtype=torch.float32).cuda()
+ # —— STEP2: 构建损失（优先 Tversky，其次 Focal，其次 CrossEntropy）—— 
+    if cfg.get('use_tversky_loss', False):
+        # 使用本地实现的 TverskyLoss，无需外部依赖
+        alpha_t = cfg.get('tversky_alpha', 0.3)
+        beta_t  = cfg.get('tversky_beta', 0.7)
+        criterion = TverskyLoss(alpha=alpha_t, beta=beta_t, reduction='mean').cuda()
+        logging.info(f"[DEBUG] 使用 Tversky Loss, alpha={alpha_t}, beta={beta_t}")
+    elif cfg.get('use_focal_loss', False):
+        logging.info("[DEBUG] >>> entering use_focal_loss block")
+        if cfg.get('use_cb_focal_loss', False):
+            logging.info("[DEBUG] >>> entering CB-Focal-Loss branch")
+            beta_cb = cfg.get('cb_beta', 0.9999)
+            alpha = compute_effective_class_weights_by_voxel(
+                train_dataset,
+                cfg.num_classes,
+                beta=beta_cb,
+                voxel_size=cfg.dataset.common.voxel_size
+            )
+            logging.info(f"[DEBUG]   → computed CB alpha by voxel: {alpha.cpu().tolist()}")
+            logging.info(f"[DEBUG] using CB-Focal-Loss, beta: {beta_cb}, alpha (CB weights): {alpha.cpu().tolist()}")
         else:
-            alpha = torch.ones(cfg.num_classes, dtype=torch.float32).cuda()
+            if cfg.get('cls_weighed_loss', False) and cfg.criterion_args.weight is not None:
+                alpha = torch.tensor(cfg.criterion_args.weight, dtype=torch.float32).cuda()
+            else:
+                alpha = torch.ones(cfg.num_classes, dtype=torch.float32).cuda()
+            logging.info(f"[DEBUG] using standard Focal-Loss alpha: {alpha.cpu().tolist()}")
         gamma = cfg.get('focal_gamma', 2.0)
-        # 覆盖成 Focal Loss，不再传递已被过滤的 ignore_index
         criterion = lambda logits, target: focal_loss(
             logits, target,
             alpha=alpha,
             gamma=gamma,
-            
         )
-        logging.info(f"[DEBUG] focal alpha: {alpha.cpu().tolist()}, gamma: {gamma}")
-
+        logging.info(f"[DEBUG] focal gamma: {gamma}")
+    else:
+        if cfg.get('cls_weighed_loss', False):
+            cfg.criterion_args.weight = torch.tensor(
+                cfg.criterion_args.weight,
+                dtype=torch.float32
+            ).cuda()
+        else:
+            cfg.criterion_args.weight = None
+        criterion = build_criterion_from_cfg(cfg.criterion_args).cuda()
     # ===> start training
     if cfg.use_amp:
         scaler = torch.cuda.amp.GradScaler()
@@ -578,7 +767,25 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
         vis_points(data['pos'].cpu().numpy()[0], labels=data['y'].cpu().numpy()[0])
         vis_points(data['pos'].cpu().numpy()[0], data['x'][0, :3, :].transpose(1, 0))
         end of debug """
+                
+                # 从 data['x'] 取出原始 4 通道特征
+        raw_feat   = data['x']                # (B,4,N)
+        normals    = raw_feat[:, :3, :]       # (B,3,N)
+        curvature  = raw_feat[:, 3:4, :]      # (B,1,N)
+        data['normals']   = normals
+        data['curvature'] = curvature
+        # —— 再拼 3+3+1=7 通道 —— 
         data['x'] = get_features_by_keys(data, cfg.feature_keys)
+        print(">>> feature_keys =", cfg.feature_keys)  
+        print(">>> keys in data before merge:", list(data.keys()))  
+        print(">>> data['pos'].shape:", data['pos'].shape)  
+        print(">>> data['normals'].shape:", data['normals'].shape)  
+        print(">>> data['curvature'].shape:", data['curvature'].shape)  
+        print(">>> before merge data['x'].shape:", data['x'].shape)  
+        data['x'] = get_features_by_keys(data, cfg.feature_keys)
+        print(">>> after merge data['x'].shape:", data['x'].shape)
+
+
         data['epoch'] = epoch
         total_iter += 1 
         data['iter'] = total_iter 
@@ -636,7 +843,16 @@ def validate(model, val_loader, cfg, num_votes=1, data_transform=None, epoch=-1,
         for key in keys:
             data[key] = data[key].cuda(non_blocking=True)
         target = data['y'].squeeze(-1)
+                
+               # —— 拆分原始 data['x']（4 通道特征） ——  
+        raw_feat   = data['x']                  # (B,4,N)
+        normals    = raw_feat[:, :3, :]         # (B,3,N)
+        curvature  = raw_feat[:, 3:4, :]        # (B,1,N)
+        data['normals']   = normals
+        data['curvature'] = curvature
+        # —— 再拼接 7 通道输入 ——  
         data['x'] = get_features_by_keys(data, cfg.feature_keys)
+
         data['epoch'] = epoch
         data['iter'] = total_iter 
         logits = model(data)
@@ -710,14 +926,24 @@ def validate_sphere(model, val_loader, cfg, num_votes=1, data_transform=None, ep
     pbar = tqdm(enumerate(val_loader), total=val_loader.__len__())
     all_logits, idx_points = [], []
     for idx, data in pbar:
+        # 1) 先把所有张量推到 GPU
         for key in data.keys():
             data[key] = data[key].cuda(non_blocking=True)
+        # 2) 拆分 feat → normals(3通道) & curvature(1通道)
+        normals   = data['feat'][:, :3, :]
+        curvature = data['feat'][:, 3:4, :]
+        data['normals']   = normals
+        data['curvature'] = curvature
+
+        # 3) 再按 FEATURE_KEYS 拼成 x（3+3+1=7通道）  
         data['x'] = get_features_by_keys(data, cfg.feature_keys)
         data['epoch'] = epoch
         data['iter'] = total_iter 
+
         logits = model(data)
         all_logits.append(logits)
         idx_points.append(data['input_inds'])
+
     all_logits = torch.cat(all_logits, dim=0).transpose(1, 2).reshape(-1, cfg.num_classes)
     idx_points = torch.cat(idx_points, dim=0).flatten()
 
@@ -859,6 +1085,14 @@ def test(model, data_list, cfg, num_votes=1):
 
                 for key in data.keys():
                     data[key] = data[key].cuda(non_blocking=True)
+                               # —— 拆分原始 feat_part（4 通道特征） ——  
+                # 此时 data['x'] 已包含 feat_part  
+                raw_feat_part   = data['x'].squeeze(0)          # (N,4)
+                normals_part    = raw_feat_part[:, :3]          # (N,3)
+                curvature_part  = raw_feat_part[:, 3:]          # (N,1)
+                data['normals']   = torch.from_numpy(normals_part).unsqueeze(0).cuda(non_blocking=True)
+                data['curvature'] = torch.from_numpy(curvature_part).unsqueeze(0).cuda(non_blocking=True)
+                # —— 再拼接 7 通道输入 ——  
                 data['x'] = get_features_by_keys(data, cfg.feature_keys)
                 logits = model(data)
                 """visualization in debug mode. !!! visulization is not correct, should remove ignored idx.
