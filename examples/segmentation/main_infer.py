@@ -125,27 +125,35 @@ class ImbalancedDatasetSampler(Sampler):
 
     def __len__(self):
         return len(self.weights)
-
+    
 def focal_loss(inputs, targets, alpha, gamma=2.0, ignore_index=None):
     """
     inputs: (B, C, N) logits  targets: (B, N) long  
     alpha: Tensor(C,) class balance weights  
     """
+    # 这个函数实现了Focal Loss计算，用于点云分割任务中的损失函数，特别适合处理类别不均衡问题，通过alpha（类权重）和gamma（焦点参数）调整。
+    # 作用：基于输入的logits和targets计算Focal Loss，支持类平衡权重alpha。Focal Loss通过降低易分类样本的权重，焦点关注难分类样本，提高模型对少数类的敏感度。
     B, C, N = inputs.shape
+    # 展平inputs到 (-1, C)（所有点的logits），targets到 (-1,)。
     preds = inputs.permute(0,2,1).reshape(-1, C)
     gts   = targets.view(-1)
+    # 过滤有效标签：valid = (gts >= 0) & (gts < C)，排除无效或越界标签（C是num_classes）。
     valid = (gts >= 0) & (gts < C)
     preds = preds[valid]
     gts   = gts[valid]
     # 若无有效样本，直接返回 0 loss
     if preds.numel() == 0:
         return torch.tensor(0.0, device=inputs.device)
-    # 计算 focal loss
+    # 计算交叉熵的负logpt（使用F.cross_entropy，reduction='none'得到逐点损失）
     logpt = -F.cross_entropy(preds, gts, weight=None, reduction='none')
+    # pt = exp(logpt)（softmax概率的等效，表示分类置信度）。
     pt    = torch.exp(logpt)
+    # at = alpha[gts]（为每个有效标签取对应类权重）。
     at    = alpha[gts]
+    # 损失 = -at * (1 - pt)^gamma * logpt，求所有有效点的均值
     loss  = -at * ((1 - pt) ** gamma) * logpt
     return loss.mean()
+
 
 def compute_effective_class_weights(dataset, num_classes, beta=0.9999):
      """
@@ -190,6 +198,9 @@ def compute_effective_class_weights_by_voxel(dataset, num_classes, beta=0.9999, 
     """
     统计所有子云中，每个类别出现过的不同体素数，计算 CB 权重。
     """
+    # 这个函数计算基于体素的类平衡权重（Class-Balanced weights），用于损失函数如Focal Loss的alpha参数。
+    # 作用：针对点云数据的不均衡，统计每个类出现的独特体素数（而非点数），避免密度影响；然后用Cui et al. (CVPR 2019)的有效样本数公式计算权重，让少数类权重更高。
+    # 构建思路：点云中点可能密集，用体素化“稀疏化”计数；用平均每文件n_i缩小量级，防止数值溢出；beta接近1让权重平滑（大类n_i大，beta^{n_i}≈0，权重≈1；小类n_i小，权重高）
     import numpy as _np
     from openpoints.dataset.data_util import voxelize
 
@@ -221,7 +232,14 @@ class TverskyLoss(nn.Module):
     """
     Tversky Loss for point cloud segmentation.
     """
+    # 这个类实现了Tversky Loss，用于点云分割任务的损失函数，继承torch.nn.Module。
+    # 作用：Tversky Loss是Dice Loss的泛化，通过α和β调节假阳性(FP)和假阴性(FN)的权重，让损失更关注不均衡类（e.g., α小强调召回，β小强调精度）。适用于点云中少数类分割，提高IoU-like指标。
+    # 构建思路：基于Tversky指数（类似IoU），损失=1-指数；用eps防分母0；支持reduction='mean'/'sum'。
+
     def __init__(self, alpha=0.3, beta=0.7, eps=1e-6, reduction='mean'):
+        # 初始化参数：alpha控制FP权重（默认0.3，低值强调减少FP，提高精度），beta控制FN（默认0.7，高值强调减少FN，提高召回）。
+        # eps=1e-6防数值不稳（高中：小数加eps避免除0）。
+        # reduction决定损失聚合：'mean'求平均（默认，稳定训练），'sum'求和。
         super().__init__()
         self.alpha = alpha
         self.beta = beta
@@ -233,21 +251,22 @@ class TverskyLoss(nn.Module):
         inputs: (B, C, N)  网络输出的 logits
         targets: (B, N)    对应的点级标签
         """
-        # 计算概率
+        # 1) 将 logits 转为各类概率，形状 (B, C, N)
         probs = F.softmax(inputs, dim=1)
-        # one-hot 编码
+        # 2) 构建 one-hot 编码掩码，形状 (B, C, N)
         with torch.no_grad():
-            one_hot = torch.zeros_like(probs)
-            one_hot.scatter_(1, targets.unsqueeze(1), 1)
-        # 计算 TP, FP, FN
-        dims = (0, 2)  # 对 batch 和点维度求和
-        TP = torch.sum(probs * one_hot, dims)
-        FP = torch.sum(probs * (1 - one_hot), dims)
-        FN = torch.sum((1 - probs) * one_hot, dims)
-        # 计算 Tversky 指数
+            one_hot = torch.zeros_like(probs)                 # 全零张量
+            one_hot.scatter_(1, targets.unsqueeze(1), 1)      # 在 class 维度填 1
+        # 3) 计算 TP、FP、FN（对 batch 和点两维求和）
+        dims = (0, 2)  # 汇总维度：批次和点数
+        TP = torch.sum(probs * one_hot, dims)              # 真实正类被正确预测的概率和        
+        FP = torch.sum(probs * (1 - one_hot), dims)        # 错误预测为正类的概率和 
+        FN = torch.sum((1 - probs) * one_hot, dims)        # 漏检的真实正类概率和
+        # 4) 计算 Tversky 指数： (TP + eps) / (TP + α·FP + β·FN + eps)
         tversky = (TP + self.eps) / (TP + self.alpha * FP + self.beta * FN + self.eps)
-        # 损失 = 1 - 指数
+        # 5) 损失 = 1 - Tversky 指数
         loss = 1.0 - tversky
+        # 6) 依据 reduction 聚合
         if self.reduction == 'mean':
             return loss.mean()
         elif self.reduction == 'sum':
@@ -321,6 +340,23 @@ def generate_data_list(cfg):
 
 
 def load_data(data_path, cfg):
+    """
+    流程：
+      1. 根据 cfg.dataset.common.NAME 判断数据集类型；
+      2. 进入对应分支读取原始文件，提取坐标(coord)、特征(feat)和标签(label)；
+      3. 对特征做归一化或预处理，对标签做必要过滤与重映射；
+      4. 将坐标平移至原点（最小坐标为 0）；
+
+    函数作用：
+      将不同格式的数据文件统一加载为：
+        - coord: (N,3) 的 float32 数组
+        - feat:  (N,F) 的 float32 数组（F 依数据集而异）
+        - label: (N,)  的 int64 数组或 None
+
+    内部原理：
+      通过字符串匹配选择数据集分支，分别调用 NumPy/torch/load、PlyData 解析等库函数；
+      归一化将原始颜色或法向量映射到 [0,1]，掩码与重映射处理不平衡类别。
+      """
     label, feat = None, None
     if 's3dis' in cfg.dataset.common.NAME.lower():
         data = np.load(data_path)  # xyzrgbl, N*7
@@ -341,56 +377,88 @@ def load_data(data_path, cfg):
         # —— 新增 OpenTrench3D .ply 文件读取 —— 
     elif 'opentrench3d' in cfg.dataset.common.NAME.lower():
         from plyfile import PlyData
-        # ① 读坐标/颜色/原始 class
         ply   = PlyData.read(data_path)
         v     = ply['vertex']
+        # ① 读坐标/颜色/原始 class
         coord = np.stack([v['x'],v['y'],v['z']],axis=-1).astype(np.float32)
         # 同时读取 法向量 (nx,ny,nz) 和 曲率 (curvature)
-        
         normals = np.stack([v['nx'], v['ny'], v['nz']], axis=-1).astype(np.float32)
         curv    = np.expand_dims(np.array(v['curvature'], dtype=np.float32), 1)  # (N,1)
         feat    = np.concatenate([normals, curv], axis=1)                        # (N,4)
         print(">>> ENTERED OPENTRENCH3D BRANCH", flush=True)
         print(f">>> RAW feat.shape = {feat.shape}", flush=True)
-        labels = np.array(v['class'], dtype=np.int64)
 
         # ② 过滤掉 ignore_label
-        mask = labels != cfg.ignore_label
-        coord, feat, labels = coord[mask], feat[mask], labels[mask]
+        labels = np.array(v['class'], dtype=np.int64)
+        # ② 过滤掉 ignore_label
+        ignore_lbl = getattr(cfg, 'ignore_label', cfg.dataset.get('ignore_label', None))
+        if ignore_lbl is not None:
+            mask = labels != ignore_lbl
+            coord, feat, labels = coord[mask], feat[mask], labels[mask]
+
 
         # ③ 二分类重映射：0=Other, 1=Trench
         trench_id = cfg.dataset.common.trench_class_id
         labels = np.where(labels == trench_id, 1, 0).astype(np.int64)
 
         label = labels
+    # 最后：将坐标平移，确保最小值为 0
     coord -= coord.min(0)
 
     idx_points = []
     voxel_idx, reverse_idx_part,reverse_idx_sort = None, None, None
     voxel_size = cfg.dataset.common.get('voxel_size', None)
+    """  
+    流程：
+  1. 判断 cfg.dataset.common.get('voxel_size') 是否非 None；
+  2. 若非 None，调用 voxelize() 得到：
+       - idx_sort: 按体素编号排序后的点索引
+       - voxel_idx: 每个点对应的体素编号
+       - count: 每个体素包含的点数
+     然后根据 cfg.test_mode 分两种子云采样方式：
+       a) 'nearest_neighbor'：每个体素随机选一个点，打乱顺序，并记录逆向索引
+       b) 其他（multi_voxel）：对每个体素循环采样一个子云，打乱后直接追加
+  3. 若 voxel_size 为 None，则将所有点作为单一子云
+  4. 最终将 idx_points、voxel_idx、reverse_idx_part、reverse_idx_sort 返回
+函数作用：
+  将完整点云按体素网格划分成多个子云（子点集）的索引列表，以支持分批或多次投票推理。
+内部原理：
+  - voxelize 利用空间量化将点映射到体素格并输出排序、编号与计数信息；
+  - 前缀和 + 取模 或 直接迭代，快速计算每个体素的采样索引；
+  - 随机打乱并记录逆向索引，方便后续将模型输出点结果还原到原始顺序。
 
+    """
     if voxel_size is not None:
         # idx_sort: original point indicies sorted by voxel NO.
         # voxel_idx: Voxel NO. for the sorted points
+         # 1) 体素化：排序索引、体素编号、每体素点数
         idx_sort, voxel_idx, count = voxelize(coord, voxel_size, mode=1)
+        # 2) 最近邻模式：每体素仅保留一个随机点
         if cfg.get('test_mode', 'multi_voxel') == 'nearest_neighbor':
+            # 2.1) 计算每个体素的随机采样偏移
             idx_select = np.cumsum(np.insert(count, 0, 0)[0:-1]) + np.random.randint(0, count.max(), count.size) % count
+            # 2.2) 根据偏移选择点索引，得到子云
             idx_part = idx_sort[idx_select]
+            # 2.3) 获取子云点总数并打乱顺序
             npoints_subcloud = voxel_idx.max()+1
             idx_shuffle = np.random.permutation(npoints_subcloud)
             idx_part = idx_part[idx_shuffle] # idx_part: randomly sampled points of a voxel
+            # 2.4) 构建逆向索引，用于恢复原序
             reverse_idx_part = np.argsort(idx_shuffle, axis=0) # revevers idx_part to sorted
             idx_points.append(idx_part)
+            # 2.5) 整体体素排序的逆向索引
             reverse_idx_sort = np.argsort(idx_sort, axis=0)
+        # 3) 多体素模式：对每个可能 i%count 子云采样
         else:
             for i in range(count.max()):
                 idx_select = np.cumsum(np.insert(count, 0, 0)[0:-1]) + i % count
                 idx_part = idx_sort[idx_select]
                 np.random.shuffle(idx_part)
                 idx_points.append(idx_part)
+    # 4) 如果没有体素化，就把所有点都当作一个子云
     else:
-                # 如果不做体素化，就把所有点都当作一个子云
         idx_points.append(np.arange(coord.shape[0]))
+    # 返回子云索引列表及重建所需的逆向索引
     return coord, feat, label, idx_points, voxel_idx, reverse_idx_part, reverse_idx_sort
 
 
@@ -762,28 +830,28 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
             data[key] = data[key].cuda(non_blocking=True)
         num_iter += 1
         target = data['y'].squeeze(-1)
+                # —— 只在第一条 batch 打印一次调试信息 ——  
+        if idx == 0:
+            print(f">>> DEBUG keys in batch: {list(data.keys())}")
+            print(f">>> DEBUG x shape: {data['x'].shape}")
+
         """ debug
         from openpoints.dataset import vis_points
         vis_points(data['pos'].cpu().numpy()[0], labels=data['y'].cpu().numpy()[0])
         vis_points(data['pos'].cpu().numpy()[0], data['x'][0, :3, :].transpose(1, 0))
         end of debug """
-                
-                # 从 data['x'] 取出原始 4 通道特征
+        # 重点：这样分步做的核心目的是 解耦 和 配置驱动！       
+        # 从 data['x'] 取出原始 4 通道特征
         raw_feat   = data['x']                # (B,4,N)
         normals    = raw_feat[:, :3, :]       # (B,3,N)
         curvature  = raw_feat[:, 3:4, :]      # (B,1,N)
         data['normals']   = normals
         data['curvature'] = curvature
-        # —— 再拼 3+3+1=7 通道 —— 
-        data['x'] = get_features_by_keys(data, cfg.feature_keys)
-        print(">>> feature_keys =", cfg.feature_keys)  
-        print(">>> keys in data before merge:", list(data.keys()))  
-        print(">>> data['pos'].shape:", data['pos'].shape)  
-        print(">>> data['normals'].shape:", data['normals'].shape)  
-        print(">>> data['curvature'].shape:", data['curvature'].shape)  
-        print(">>> before merge data['x'].shape:", data['x'].shape)  
-        data['x'] = get_features_by_keys(data, cfg.feature_keys)
-        print(">>> after merge data['x'].shape:", data['x'].shape)
+        
+        
+        feat_arg = cfg.feature_keys if isinstance(cfg.feature_keys, str) \
+                   else ','.join(cfg.feature_keys)
+        data['x'] = get_features_by_keys(data, feat_arg)   # 它直接输出 (B,4,N)，正好给 Conv1d
 
 
         data['epoch'] = epoch

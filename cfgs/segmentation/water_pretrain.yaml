@@ -25,6 +25,12 @@ dataset:
   ignore_label: 4                 # 解释：标签值为 4 的点将被忽略，不参与损失计算  
   area: water                     # 解释：同上，顶层的子集标识  
 
+    # ===== 测试集 =====
+  test:
+    root: /home/tech/pointnext/datasets/OpenTrench3D
+    split: val_pre        # 若有 test_pre，改成 test_pre
+    area: water
+
 # —— 模型配置 ——  
 model:
   NAME: BaseSeg                   # 解释：Registry 中注册的分割模型名称  
@@ -135,8 +141,15 @@ datatransforms:
       
     - PointCloudToTensor
     - PointCloudXYZAlign  
-    - ChromaticNormalize  
+    - ChromaticNormalize
+    # --------------------  新增  --------------------
+  test:                          # ☆ 只给“测试”专用
+    - PointCloudToTensor         # ① 先转 tensor，避免 .device 报错
+    - PointCloudXYZAlign         # ② 可选坐标对齐
+    - ChromaticNormalize         # ③ 保留归一化
+  # ------------------------------------------------  
   vote:
+    - PointCloudToTensor        # 解释：投票阶段的点云转换为张量
     - ChromaticDropGPU          # 解释：投票阶段的数据增强  
   kwargs:
     num_points: 8964            # 解释：采样后的点数  
