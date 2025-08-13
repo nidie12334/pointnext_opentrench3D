@@ -852,7 +852,21 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
         feat_arg = cfg.feature_keys if isinstance(cfg.feature_keys, str) \
                    else ','.join(cfg.feature_keys)
         data['x'] = get_features_by_keys(data, feat_arg)   # 它直接输出 (B,4,N)，正好给 Conv1d
+        # ===== 仅首个 batch 打印通道统计，用于与推理对齐 =====
+        if idx == 0 and 'x' in data:
+            # 原始4通道（拆 normals/curvature 之前的 data['x']）
+            rf = raw_feat[0]   # (4,N)
+            rf_mins  = rf.min(dim=1).values.detach().cpu().numpy()
+            rf_maxs  = rf.max(dim=1).values.detach().cpu().numpy()
+            rf_means = rf.mean(dim=1).detach().cpu().numpy()
+            print(f"[CHK][train][raw x]   min={rf_mins}, max={rf_maxs}, mean={rf_means}")
 
+            # 最终送模型的4通道（经 get_features_by_keys 之后）
+            xf = data['x'][0]  # (4,N)
+            xf_mins  = xf.min(dim=1).values.detach().cpu().numpy()
+            xf_maxs  = xf.max(dim=1).values.detach().cpu().numpy()
+            xf_means = xf.mean(dim=1).detach().cpu().numpy()
+            print(f"[CHK][train][final x] min={xf_mins}, max={xf_maxs}, mean={xf_means}")
 
         data['epoch'] = epoch
         total_iter += 1 
@@ -1104,7 +1118,21 @@ def test(model, data_list, cfg, num_votes=1):
     trans_split = 'val' if cfg.datatransforms.get('test', None) is None else 'test'
     pipe_transform = build_transforms_from_cfg(trans_split, cfg.datatransforms)
 
+    # 立刻加上：
+    DEBUG = True  # 用完可以改成 False 或从 cfg 读取
+    if DEBUG:
+        logging.info(f"[CHK] split used for transforms: {trans_split}")
+        # 打印 transform 顺序
+        try:
+            names = [t.__class__.__name__ for t in getattr(pipe_transform, 'transforms', [])]
+            logging.info(f"[CHK] transforms(test): {names}")
+        except Exception as e:
+            logging.info(f"[CHK] transforms repr: {pipe_transform} (err={e})")
+        logging.info(f"[CHK] feature_keys: {cfg.get('feature_keys', None)}, num_classes: {cfg.num_classes}, ignore_idx: {cfg.ignore_index}")
+
     dataset_name = cfg.dataset.common.NAME.lower()
+    # 【ADD】只推理前 N 个点云，便于快速可视化
+    limit_n = int(cfg.get('limit_test_clouds', 0) or 0)
     len_data = len(data_list)
 
     cfg.save_path = cfg.get('save_path', f'results/{cfg.task_name}/{cfg.dataset.test.split}/{cfg.cfg_basename}')
@@ -1120,7 +1148,13 @@ def test(model, data_list, cfg, num_votes=1):
         all_logits = []
         coord, feat, label, idx_points, voxel_idx, reverse_idx_part, reverse_idx  = load_data(data_path, cfg)
         if label is not None:
-            label = torch.from_numpy(label.astype(np.int).squeeze()).cuda(non_blocking=True)
+            label = torch.from_numpy(label.astype(np.int64, copy=False)).to('cuda', non_blocking=True).squeeze()
+        # 立刻加上：
+        if DEBUG and cloud_idx < 3 and label is not None:
+            u, c = torch.unique(label, return_counts=True)
+            logging.info(f"[CHK] GT hist (cloud {cloud_idx}): {{ {', '.join([f'{int(a)}:{int(b)}' for a,b in zip(u.cpu(), c.cpu())])} }}")
+            # 期望：只出现 {0,1}（以及可能的 ignore_label），否则说明映射不一致
+            logging.info(f"[CHK] num subclouds: {len(idx_points)} ; first 3 sizes: {[len(idx_points[i]) for i in range(min(3,len(idx_points)))]}")
 
         len_part = len(idx_points)
         nearest_neighbor = len_part == 1
@@ -1129,44 +1163,134 @@ def test(model, data_list, cfg, num_votes=1):
             pbar.set_description(f"Test on {cloud_idx}-th cloud [{idx_subcloud}]/[{len_part}]]")
             if not (nearest_neighbor and idx_subcloud>0):
                 idx_part = idx_points[idx_subcloud]
-                coord_part = coord[idx_part]
-                coord_part -= coord_part.min(0)
+                coord_part = coord[idx_part]  # 与训练/验证保持一致：不做手工平移到最小值
 
-                feat_part =  feat[idx_part] if feat is not None else None
-                data = {'pos': coord_part}
+                feat_part = feat[idx_part] if feat is not None else None
+                # ☆ 关键修复：先提供 x 给 transforms（否则 ChromaticNormalize 会找不到 data['x']）
+                data = {'pos': coord_part.astype(np.float32, copy=False)}
                 if feat_part is not None:
-                    data['x'] = feat_part
+                    # 占位 x：给 ChromaticNormalize 用，但不让它污染真特征
+                    data['x'] = np.zeros((coord_part.shape[0], 3), dtype=np.float32)  # (N,3)
+
+                    # 真正的特征单独保存，待 transforms 之后再组回
+                    normals_np   = feat_part[:, :3].astype(np.float32, copy=False)   # (N,3)
+                    curvature_np = feat_part[:,  3].astype(np.float32, copy=False)   # (N,)
+                    data['normals']   = normals_np
+                    data['curvature'] = curvature_np
+
+                # 跑 test/val 的 transforms（会同步处理 pos/normals）
                 if pipe_transform is not None:
                     data = pipe_transform(data)
-                if 'heights' in cfg.feature_keys and 'heights' not in data.keys():
-                    if 'semantickitti' in cfg.dataset.common.NAME.lower():
-                        data['heights'] = torch.from_numpy((coord_part[:, gravity_dim:gravity_dim + 1] - coord_part[:, gravity_dim:gravity_dim + 1].min()).astype(np.float32)).unsqueeze(0)
+                # 训练同款：由 feature_keys 重新组回 x（做法向/曲率的归一化/拼接）
+                # === transforms 之后：从 normals/curvature 手工组回 x，避免 ChromaticNormalize 误处理 ===
+                # 保证 Tensor 类型
+                if isinstance(data['pos'], np.ndarray):
+                    data['pos'] = torch.from_numpy(data['pos']).float()
+                normals = data['normals']
+                curv    = data['curvature']
+                if isinstance(normals, np.ndarray):
+                    normals = torch.from_numpy(normals).float()
+                if isinstance(curv, np.ndarray):
+                    curv = torch.from_numpy(curv).float()
+
+                # === 形状强规范：把 normals 变成 (N,3)，curv 变成 (N,1) ===
+                # 推断 N（在 pos 还没加 batch 维之前）
+                N = data['pos'].shape[0] if data['pos'].dim() == 2 else data['pos'].shape[1]
+
+                # normals 可能是 (N,3) / (3,N) / (1,N,3)
+                if normals.dim() == 3:
+                    normals = normals.squeeze(0)                 # (1,N,3) -> (N,3)
+                if normals.dim() == 2 and normals.shape[0] == 3 and normals.shape[1] == N:
+                    normals = normals.transpose(0, 1)           # (3,N) -> (N,3)
+                assert normals.dim() == 2 and normals.shape[0] == N and normals.shape[1] == 3, \
+                    f"normals bad shape: {tuple(normals.shape)}, expect (N,3) with N={N}"
+
+                # curvature 可能是 (N,) / (N,1) / (1,N) / (1,N,1)
+                if curv.dim() == 3:
+                    curv = curv.squeeze(0)                      # (1,N,1) 或 (1,N) -> (N,1)/(N,)
+                if curv.dim() == 2:
+                    if curv.shape == (1, N):
+                        curv = curv.transpose(0, 1)             # (1,N) -> (N,1)
+                    elif curv.shape == (N,):
+                        curv = curv.unsqueeze(1)                 # (N,) -> (N,1)
+                    elif curv.shape == (N, 1):
+                        pass
                     else:
-                        data['heights'] = torch.from_numpy(coord_part[:, gravity_dim:gravity_dim + 1].astype(np.float32)).unsqueeze(0)
+                        raise RuntimeError(f"curvature bad shape: {tuple(curv.shape)}, expect (N,1)")
+                elif curv.dim() == 1:
+                    if curv.shape[0] == N:
+                        curv = curv.unsqueeze(1)                 # (N,) -> (N,1)
+                    else:
+                        raise RuntimeError(f"curvature bad len: {tuple(curv.shape)}, expect N={N}")
+                else:
+                    raise RuntimeError(f"curvature bad dim: {curv.dim()}")
+
+                # 现在可以安全拼接
+                data['x'] = torch.cat([normals, curv], dim=1)   # (N,4)
+
+
+                
                 if not cfg.dataset.common.get('variable', False):
-                    if 'x' in data.keys():
-                        data['x'] = data['x'].unsqueeze(0)
-                    data['pos'] = data['pos'].unsqueeze(0)
+                    # pos：只有 2 维时再加批维 -> (1, N, 3)
+                    if data['pos'].dim() == 2:
+                        data['pos'] = data['pos'].unsqueeze(0)
+
+                    # x：规范到 (B, C, N)
+                    if 'x' in data:
+                        if data['x'].dim() == 2:
+                            # 可能是 (N, C) 或 (C, N)：用 pos 的 N 来判断
+                            N = data['pos'].shape[1] if data['pos'].dim() == 3 else data['pos'].shape[0]
+                            if data['x'].shape[0] == N:      # (N, C) -> (C, N)
+                                data['x'] = data['x'].transpose(0, 1)
+                            data['x'] = data['x'].unsqueeze(0)  # -> (1, C, N)
+                        elif data['x'].dim() == 3:
+                            pass                                # 已是 (B, C, N)，不处理
+                        elif data['x'].dim() == 4:
+                            # 出现 (1, 1, C, N) 这类情况，挤掉多余的 1 维 -> (1, C, N)
+                            data['x'] = data['x'].squeeze(0)
+                        else:
+                            raise RuntimeError(f"Unexpected x shape {tuple(data['x'].shape)}")
                 else:
                     data['o'] = torch.IntTensor([len(coord)])
                     data['batch'] = torch.LongTensor([0] * len(coord))
 
+
                 for key in data.keys():
                     data[key] = data[key].cuda(non_blocking=True)
-                               # —— 拆分原始 feat_part（4 通道特征） ——  
-                # 此时 data['x'] 已包含 feat_part  
-                raw_feat_part   = data['x'].squeeze(0)          # (N,4)
-                normals_part    = raw_feat_part[:, :3]          # (N,3)
-                curvature_part  = raw_feat_part[:, 3:]          # (N,1)
-                data['normals']   = torch.from_numpy(normals_part).unsqueeze(0).cuda(non_blocking=True)
-                data['curvature'] = torch.from_numpy(curvature_part).unsqueeze(0).cuda(non_blocking=True)
-                # —— 再拼接 7 通道输入 ——  
-                data['x'] = get_features_by_keys(data, cfg.feature_keys)
+                # ☆ 保守形状检查：若误成 (B,N,C)，再转回 (B,C,N)
+                if 'x' in data and data['x'].dim() == 3 and data['x'].shape[1] == data['pos'].shape[1]:
+                    data['x'] = data['x'].transpose(1, 2).contiguous()
+                # [自检3] —— 送模型前形状核对（只打印首帧首块，避免刷屏）
+                if DEBUG and cloud_idx == 0 and idx_subcloud == 0:
+                    logging.info(
+                        f"[CHK] pos shape: {tuple(data['pos'].shape)} ; "
+                        f"x shape: {tuple(data['x'].shape)} ; "
+                        f"x dtype/device: {data['x'].dtype}/{data['x'].device}"
+                    )
+                # [自检3b] —— x 各通道数值范围（判断是不是 [法向x,法向y,法向z,曲率]）
+                    if 'x' in data:
+                        x0 = data['x']  # (B,C,N) 期望
+                        if x0.dim() == 3:
+                            x0 = x0[0]  # (C,N)
+                        mins  = x0.min(dim=1).values.detach().cpu().numpy()
+                        maxs  = x0.max(dim=1).values.detach().cpu().numpy()
+                        means = x0.mean(dim=1).detach().cpu().numpy()
+                        logging.info(f"[CHK] x channel stats: min={mins}, max={maxs}, mean={means}")
+                    # 期望：pos=(1, n_i, 3) ; x=(1, n_i, 4)
                 logits = model(data)
                 """visualization in debug mode. !!! visulization is not correct, should remove ignored idx.
                 from openpoints.dataset.vis3d import vis_points, vis_multi_points
                 vis_multi_points([coord, coord_part], labels=[label.cpu().numpy(), logits.argmax(dim=1).squeeze().cpu().numpy()])
                 """
+                # [自检4] —— 单子块预测分布（仅首两帧的 首/中/末 三个子块）
+                if DEBUG and cloud_idx < 2 and idx_subcloud in (0, len(idx_points)//2, len(idx_points)-1):
+                    with torch.no_grad():
+                        pred_blk = logits.argmax(dim=1).flatten()
+                        v, c = torch.unique(pred_blk, return_counts=True)
+                        logging.info(
+                            f"[DBG] block pred hist (cloud {cloud_idx} blk {idx_subcloud}): "
+                            f"{{ {', '.join([f'{int(a)}:{int(b)}' for a,b in zip(v.cpu(), c.cpu())])} }}"
+                        )
 
             all_logits.append(logits)
         all_logits = torch.cat(all_logits, dim=0)
@@ -1174,13 +1298,54 @@ def test(model, data_list, cfg, num_votes=1):
             all_logits = all_logits.transpose(1, 2).reshape(-1, cfg.num_classes)
 
         if not nearest_neighbor:
-            # average merge overlapped multi voxels logits to original point set
+            # 先在 logit 空间融合，再 softmax；避免少数类被概率均值稀释
             idx_points = torch.from_numpy(np.hstack(idx_points)).cuda(non_blocking=True)
-            all_logits = scatter(all_logits, idx_points, dim=0, reduce='mean')
+            logits_fused = scatter(all_logits, idx_points, dim=0, reduce='mean')
+            probs = torch.softmax(logits_fused, dim=1)
         else:
-            # interpolate logits by nearest neighbor
-            all_logits = all_logits[reverse_idx_part][voxel_idx][reverse_idx]
-        pred = all_logits.argmax(dim=1)
+            # 最近邻插值时同样先取概率
+            probs = torch.softmax(all_logits, dim=1)
+            probs = probs[reverse_idx_part][voxel_idx][reverse_idx]
+
+        # ☆ 动态先验校准（推理侧）：按目标先验 π 自适应缩放类0概率
+        # 传参方式：mode=test test_target_prior=0.09（不传则默认 0.09）
+        pi = float(cfg.get('test_target_prior', 0.09))  # 目标：类0占比
+        probs = probs.clamp_(1e-8, 1-1e-8)
+        odds = probs[:, 0] / probs[:, 1]                # 每点赔率 p0/p1
+        mean_odds = odds.mean()
+        s = (pi / (1.0 - pi)) / (mean_odds + 1e-12)     # 缩放系数
+        probs[:, 0] = probs[:, 0] * s
+        probs = probs / probs.sum(dim=1, keepdim=True)
+
+        # === Step 2: 阈值微调（class-1 概率阈值）===
+        # 两种模式：
+        #   fixed       : 用固定阈值 test_threshold_cls1（默认 0.50）
+        #   match_prior : 按目标先验 pi（test_target_prior）自适应阈值，使类1占比≈(1-pi)
+        thresh_mode = cfg.get('test_threshold_mode', 'fixed')  # 'fixed' or 'match_prior'
+        if thresh_mode == 'match_prior':
+            pi = float(cfg.get('test_target_prior', 0.09))     # 目标：类0占比
+            # 取 probs[:,1] 的 (1-pi) 分位数当阈值，使预测的类1比例≈(1-pi)
+            t = torch.quantile(probs[:, 1].detach(), 1.0 - pi)
+        else:
+            t = float(cfg.get('test_threshold_cls1', 0.50))
+        # 概率 >= 阈值 判为类1，否则类0
+        pred = (probs[:, 1] >= t).long()
+        if DEBUG and cloud_idx == 0:
+            logging.info(f"[CHK] cls1 threshold: {float(t):.4f} (mode={thresh_mode})")
+        
+        # [自检5] —— 整云预测分布 vs（可选）GT 分布
+        if DEBUG:
+            v_pred, c_pred = torch.unique(pred, return_counts=True)
+            logging.info(
+                f"[CHK] cloud {cloud_idx} PRED hist: "
+                f"{{ {', '.join([f'{int(a)}:{int(b)}' for a,b in zip(v_pred.cpu(), c_pred.cpu())])} }}"
+            )
+            if label is not None:
+                v_gt, c_gt = torch.unique(label, return_counts=True)
+                logging.info(
+                    f"[CHK] cloud {cloud_idx}  GT  hist: "
+                    f"{{ {', '.join([f'{int(a)}:{int(b)}' for a,b in zip(v_gt.cpu(), c_gt.cpu())])} }}"
+                )
         if label is not None:
             cm.update(pred, label)
         """visualization in debug mode
@@ -1188,10 +1353,11 @@ def test(model, data_list, cfg, num_votes=1):
         vis_multi_points([coord, coord], labels=[label.cpu().numpy(), all_logits.argmax(dim=1).squeeze().cpu().numpy()])
         """
         if cfg.visualize:
-            gt = label.cpu().numpy().squeeze() if label is not None else None
-            pred = pred.cpu().numpy().squeeze()
-            gt = cfg.cmap[gt, :] if gt is not None else None
-            pred = cfg.cmap[pred, :]
+            # 不要覆盖 pred（保持为 torch.Tensor），单独做可视化颜色
+            gt_idx = label.detach().cpu().numpy().squeeze() if label is not None else None
+            pred_idx = pred.detach().cpu().numpy().squeeze()
+            gt_vis = cfg.cmap[gt_idx, :] if gt_idx is not None else None
+            pred_vis = cfg.cmap[pred_idx, :]
             # output pred labels
             if 's3dis' in dataset_name:
                 file_name = f'{dataset_name}-Area{cfg.dataset.common.test_area}-{cloud_idx}'
@@ -1201,38 +1367,35 @@ def test(model, data_list, cfg, num_votes=1):
             write_obj(coord, feat,
                       os.path.join(cfg.vis_dir, f'input-{file_name}.obj'))
             # output ground truth labels
-            if gt is not None:
-                write_obj(coord, gt,
+            if gt_vis is not None:
+                write_obj(coord, gt_vis,
                         os.path.join(cfg.vis_dir, f'gt-{file_name}.obj'))
             # output pred labels
-            write_obj(coord, pred,
+            write_obj(coord, pred_vis,
                       os.path.join(cfg.vis_dir, f'{cfg.cfg_basename}-{file_name}.obj'))
 
         if cfg.get('save_pred', False):
             if 'semantickitti' in cfg.dataset.common.NAME.lower():
-                pred = pred + 1
-                pred = pred.cpu().numpy().squeeze()
-                pred = pred.astype(np.uint32)
-                upper_half = pred >> 16  # get upper half for instances
-                lower_half = pred & 0xFFFF  # get lower half for semantics (lower_half.shape) (100k+, )
-                lower_half = remap_lut_write[lower_half]  # do the remapping of semantics
-                pred = (upper_half << 16) + lower_half  # reconstruct full label
-                pred = pred.astype(np.uint32)
+                pred_np = (pred + 1).detach().cpu().numpy().squeeze().astype(np.uint32)
+                upper_half = pred_np >> 16  # get upper half for instances
+                lower_half = pred_np & 0xFFFF  # get lower half for semantics
+                lower_half = remap_lut_write[lower_half]  # remap semantics
+                pred_np = ((upper_half << 16) + lower_half).astype(np.uint32)
                 frame_id = data_path[0].split('/')[-1][:-4]
                 store_path = os.path.join(cfg.save_path, frame_id + '.label')
-                pred.tofile(store_path)
+                pred_np.tofile(store_path)
             elif 'scannet' in cfg.dataset.common.NAME.lower():
-                pred = pred.cpu().numpy().squeeze()
+                pred_np = pred.detach().cpu().numpy().squeeze()
                 label_int_mapping={0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 8, 8: 9, 9: 10, 10: 11, 11: 12, 12: 14, 13: 16, 14: 24, 15: 28, 16: 33, 17: 34, 18: 36, 19: 39}
-                pred=np.vectorize(label_int_mapping.get)(pred)
+                pred_np=np.vectorize(label_int_mapping.get)(pred_np)
                 save_file_name=data_path.split('/')[-1].split('_')
                 save_file_name=save_file_name[0]+'_'+save_file_name[1]+'.txt'
                 save_file_name=os.path.join(cfg.save_path,save_file_name)
-                np.savetxt(save_file_name, pred, fmt="%d")
+                np.savetxt(save_file_name, pred_np, fmt="%d")
             elif 'opentrench3d' in cfg.dataset.common.NAME.lower():
                 # —— 新增 OpenTrench3D 写入逻辑 —— 
                 # pred: torch.Tensor, shape (N,)
-                pred_np = pred.cpu().numpy().squeeze().astype(np.int32)
+                pred_np = pred.detach().cpu().numpy().squeeze().astype(np.int32)
                 # 从路径中取文件名（去掉扩展名）
                 frame_id = os.path.splitext(os.path.basename(data_path))[0]
                 out_path = os.path.join(cfg.save_path, frame_id + '.txt')
@@ -1240,7 +1403,7 @@ def test(model, data_list, cfg, num_votes=1):
                 np.savetxt(out_path, pred_np, fmt='%d')
             else:
                 # —— 其他数据集的通用写法 —— 
-                pred_np = pred.cpu().numpy().squeeze().astype(np.int32)
+                pred_np = pred.detach().cpu().numpy().squeeze().astype(np.int32)
                 frame_id = os.path.splitext(os.path.basename(data_path))[0]
                 out_path = os.path.join(cfg.save_path, frame_id + '.txt')
                 np.savetxt(out_path, pred_np, fmt='%d')
@@ -1253,6 +1416,9 @@ def test(model, data_list, cfg, num_votes=1):
                     f'[{cloud_idx}]/[{len_data}] cloud,  test_oa , test_macc, test_miou: {oa:.2f} {macc:.2f} {miou:.2f}, '
                     f'\niou per cls is: {ious}')
             all_cm.value += cm.value
+         # 【ADD】达到上限就退出外层循环（只跑一帧/几帧）
+        if limit_n and (cloud_idx + 1) >= limit_n:
+            break
 
     if 'scannet' in cfg.dataset.common.NAME.lower():
         logging.info(f" Please select and zip all the files (DON'T INCLUDE THE FOLDER) in {cfg.save_path} and submit it to"
